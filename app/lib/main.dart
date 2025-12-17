@@ -320,6 +320,12 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
   int _sourceHeight = 0;
   int _currentIndex = -1;
 
+  // Video download mode
+  bool _useLocalVideo = false;
+  String? _localVideoPath;
+  bool _isDownloading = false;
+  double _downloadProgress = 0.0;
+
   @override
   void dispose() {
     _player?.dispose();
@@ -396,6 +402,7 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
       _isLoading = true;
       _statusMessage = 'Loading config...';
       _configPath = path;
+      _localVideoPath = null; // Reset cached video path for new config
     });
 
     try {
@@ -431,57 +438,188 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
     }
   }
 
-  Future<void> _initializeVideo() async {
+  Future<void> _downloadVideo() async {
     if (_manifest == null) return;
 
     setState(() {
-      _statusMessage = 'Fetching video stream...';
+      _isDownloading = true;
+      _downloadProgress = 0.0;
+      _statusMessage = 'Downloading video to disk...';
     });
 
     try {
-      print('[DEBUG] Using yt-dlp to fetch stream URL...');
+      final home = Platform.environment['HOME'];
+      final cacheDir = '$home/.cache/za_screenshot';
+      await Directory(cacheDir).create(recursive: true);
 
-      String? streamUrl;
-      int selectedFormat = 0;
+      // Use video ID as filename
+      final videoUrl = _manifest!.metadata.videoUrl;
+      final videoId = Uri.parse(videoUrl).queryParameters['v'] ?? 'video';
+      final outputPath = '$cacheDir/$videoId.mp4';
 
-      for (final format in [137, 136, 135, 134, 18]) {
-        print('[DEBUG] Trying format $format...');
-        final result = await Process.run(
-          'yt-dlp',
-          ['-f', '$format', '-g', _manifest!.metadata.videoUrl],
-        );
-
-        if (result.exitCode == 0 && (result.stdout as String).trim().isNotEmpty) {
-          streamUrl = (result.stdout as String).trim();
-          selectedFormat = format;
-          print('[DEBUG] Got URL for format $format');
-          break;
+      // Check if already downloaded
+      final existingFile = File(outputPath);
+      if (await existingFile.exists()) {
+        final fileSize = await existingFile.length();
+        if (fileSize > 1024 * 1024) {
+          // > 1MB, assume valid
+          print('[DOWNLOAD] Using cached video: $outputPath');
+          _localVideoPath = outputPath;
+          setState(() {
+            _isDownloading = false;
+            _downloadProgress = 1.0;
+          });
+          return;
         }
       }
 
-      if (streamUrl == null) {
-        throw Exception('Could not get stream URL from yt-dlp');
+      print('[DOWNLOAD] Downloading video to: $outputPath');
+
+      // Download with yt-dlp with progress
+      final process = await Process.start(
+        'yt-dlp',
+        [
+          '-f', 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]',
+          '--merge-output-format', 'mp4',
+          '--newline',
+          '--progress',
+          '-o', outputPath,
+          videoUrl,
+        ],
+      );
+
+      // Parse progress from yt-dlp output
+      process.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
+        print('[DOWNLOAD] $line');
+        // Parse progress like "[download]  45.2% of 123.45MiB"
+        final progressMatch = RegExp(r'\[download\]\s+(\d+\.?\d*)%').firstMatch(line);
+        if (progressMatch != null) {
+          final percent = double.tryParse(progressMatch.group(1) ?? '0') ?? 0;
+          setState(() {
+            _downloadProgress = percent / 100;
+            _statusMessage = 'Downloading video... ${percent.toStringAsFixed(1)}%';
+          });
+        }
+      });
+
+      process.stderr.transform(utf8.decoder).listen((line) {
+        print('[DOWNLOAD ERROR] $line');
+      });
+
+      final exitCode = await process.exitCode;
+
+      if (exitCode != 0) {
+        throw Exception('yt-dlp download failed with exit code $exitCode');
       }
 
-      switch (selectedFormat) {
-        case 137:
+      _localVideoPath = outputPath;
+      print('[DOWNLOAD] Complete: $outputPath');
+
+      setState(() {
+        _isDownloading = false;
+        _downloadProgress = 1.0;
+        _statusMessage = 'Download complete!';
+      });
+    } catch (e, stackTrace) {
+      print('[ERROR] Download failed: $e');
+      print(stackTrace);
+      setState(() {
+        _isDownloading = false;
+        _statusMessage = 'Download failed: $e';
+      });
+      rethrow;
+    }
+  }
+
+  Future<void> _initializeVideo() async {
+    if (_manifest == null) return;
+
+    try {
+      String mediaSource;
+
+      if (_useLocalVideo) {
+        // Download video first if not already cached
+        if (_localVideoPath == null) {
+          await _downloadVideo();
+        }
+
+        if (_localVideoPath == null) {
+          throw Exception('Failed to download video');
+        }
+
+        mediaSource = _localVideoPath!;
+        // Get resolution from file using ffprobe
+        final probeResult = await Process.run('ffprobe', [
+          '-v', 'error',
+          '-select_streams', 'v:0',
+          '-show_entries', 'stream=width,height',
+          '-of', 'csv=p=0',
+          mediaSource,
+        ]);
+
+        if (probeResult.exitCode == 0) {
+          final parts = (probeResult.stdout as String).trim().split(',');
+          if (parts.length >= 2) {
+            _sourceWidth = int.tryParse(parts[0]) ?? 1920;
+            _sourceHeight = int.tryParse(parts[1]) ?? 1080;
+          }
+        } else {
           _sourceWidth = 1920;
           _sourceHeight = 1080;
-          break;
-        case 136:
-          _sourceWidth = 1280;
-          _sourceHeight = 720;
-          break;
-        case 135:
-          _sourceWidth = 854;
-          _sourceHeight = 480;
-          break;
-        default:
-          _sourceWidth = 640;
-          _sourceHeight = 360;
-      }
+        }
 
-      print('[DEBUG] Selected format: $selectedFormat (${_sourceWidth}x$_sourceHeight)');
+        print('[DEBUG] Using local video: $mediaSource (${_sourceWidth}x$_sourceHeight)');
+      } else {
+        // Stream mode - fetch URL
+        setState(() {
+          _statusMessage = 'Fetching video stream...';
+        });
+
+        print('[DEBUG] Using yt-dlp to fetch stream URL...');
+
+        String? streamUrl;
+        int selectedFormat = 0;
+
+        for (final format in [137, 136, 135, 134, 18]) {
+          print('[DEBUG] Trying format $format...');
+          final result = await Process.run(
+            'yt-dlp',
+            ['-f', '$format', '-g', _manifest!.metadata.videoUrl],
+          );
+
+          if (result.exitCode == 0 && (result.stdout as String).trim().isNotEmpty) {
+            streamUrl = (result.stdout as String).trim();
+            selectedFormat = format;
+            print('[DEBUG] Got URL for format $format');
+            break;
+          }
+        }
+
+        if (streamUrl == null) {
+          throw Exception('Could not get stream URL from yt-dlp');
+        }
+
+        switch (selectedFormat) {
+          case 137:
+            _sourceWidth = 1920;
+            _sourceHeight = 1080;
+            break;
+          case 136:
+            _sourceWidth = 1280;
+            _sourceHeight = 720;
+            break;
+          case 135:
+            _sourceWidth = 854;
+            _sourceHeight = 480;
+            break;
+          default:
+            _sourceWidth = 640;
+            _sourceHeight = 360;
+        }
+
+        print('[DEBUG] Selected format: $selectedFormat (${_sourceWidth}x$_sourceHeight)');
+        mediaSource = streamUrl;
+      }
 
       setState(() {
         _statusMessage = 'Loading video (${_sourceWidth}x$_sourceHeight)...';
@@ -492,7 +630,7 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
       );
       _videoController = media_kit.VideoController(_player!);
 
-      await _player!.open(Media(streamUrl));
+      await _player!.open(Media(mediaSource));
       await _player!.stream.playing.firstWhere((p) => p).timeout(
             const Duration(seconds: 30),
             onTimeout: () => false,
@@ -509,7 +647,9 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
 
       setState(() {
         _isLoading = false;
-        _statusMessage = 'Ready to capture ${_manifest!.screenshots.length} screenshots';
+        _statusMessage = _useLocalVideo
+            ? 'Ready (local video) - ${_manifest!.screenshots.length} screenshots'
+            : 'Ready to capture ${_manifest!.screenshots.length} screenshots';
       });
     } catch (e, stackTrace) {
       print('[ERROR] Failed to initialize video: $e');
@@ -1108,22 +1248,77 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(20),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            if (_isLoading || _isCapturing)
-              const Padding(
-                padding: EdgeInsets.only(right: 12),
-                child: SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
+            // Download mode toggle
+            Row(
+              children: [
+                Icon(
+                  _useLocalVideo ? Icons.folder : Icons.cloud,
+                  size: 20,
+                  color: _useLocalVideo ? Colors.green[400] : Colors.blue[400],
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _useLocalVideo ? 'Local mode (faster seeking)' : 'Stream mode',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Colors.grey[400],
+                    ),
+                  ),
+                ),
+                Switch(
+                  value: _useLocalVideo,
+                  onChanged: (_isLoading || _isCapturing || _isDownloading)
+                      ? null
+                      : (value) {
+                          setState(() {
+                            _useLocalVideo = value;
+                            _localVideoPath = null; // Reset cache reference
+                          });
+                        },
+                  activeColor: const Color(0xFF6C5CE7),
+                ),
+              ],
+            ),
+
+            // Download progress bar
+            if (_isDownloading) ...[
+              const SizedBox(height: 12),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: _downloadProgress,
+                  backgroundColor: Colors.grey[800],
+                  valueColor: AlwaysStoppedAnimation<Color>(Colors.green[400]!),
+                  minHeight: 6,
                 ),
               ),
-            Expanded(
-              child: Text(
-                _statusMessage,
-                style: const TextStyle(fontSize: 14),
-              ),
+            ],
+
+            const Divider(height: 24),
+
+            // Status message
+            Row(
+              children: [
+                if (_isLoading || _isCapturing || _isDownloading)
+                  const Padding(
+                    padding: EdgeInsets.only(right: 12),
+                    child: SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ),
+                Expanded(
+                  child: Text(
+                    _statusMessage,
+                    style: const TextStyle(fontSize: 14),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
