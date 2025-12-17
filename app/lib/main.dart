@@ -1,27 +1,242 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' as ui;
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart' as media_kit;
-import 'package:path_provider/path_provider.dart';
-
-const double videoScaleFactor = 4.0;
-const String targetVideoUrl = 'https://www.youtube.com/watch?v=Er5CcLF4xyg';
-
-const List<Duration> captureTimestamps = [
-  Duration(seconds: 15),
-  Duration(minutes: 1, seconds: 45),
-  Duration(minutes: 3),
-];
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
   runApp(const ZaScreenshotApp());
 }
+
+// ============================================================================
+// JSON Models
+// ============================================================================
+
+class ScreenshotManifest {
+  final ManifestMetadata metadata;
+  final Map<String, Speaker> speakers;
+  final List<ScreenshotConfig> screenshots;
+  final List<PriorityScreenshot> priorityScreenshots;
+  final List<Chapter> chapters;
+
+  ScreenshotManifest({
+    required this.metadata,
+    required this.speakers,
+    required this.screenshots,
+    required this.priorityScreenshots,
+    required this.chapters,
+  });
+
+  factory ScreenshotManifest.fromJson(Map<String, dynamic> json) {
+    return ScreenshotManifest(
+      metadata: ManifestMetadata.fromJson(json['metadata']),
+      speakers: (json['speakers'] as Map<String, dynamic>?)?.map(
+            (key, value) => MapEntry(key, Speaker.fromJson(value)),
+          ) ??
+          {},
+      screenshots: (json['screenshots'] as List?)
+              ?.map((e) => ScreenshotConfig.fromJson(e))
+              .toList() ??
+          [],
+      priorityScreenshots: (json['priority_screenshots'] as List?)
+              ?.map((e) => PriorityScreenshot.fromJson(e))
+              .toList() ??
+          [],
+      chapters: (json['chapters'] as List?)
+              ?.map((e) => Chapter.fromJson(e))
+              .toList() ??
+          [],
+    );
+  }
+}
+
+class ManifestMetadata {
+  final String videoUrl;
+  final String videoId;
+  final String videoTitle;
+  final String? source;
+  final String? series;
+  final int totalScreenshots;
+  final String? generatedAt;
+  final String language;
+  final String outputDirectory;
+  final String filenameFormat;
+
+  ManifestMetadata({
+    required this.videoUrl,
+    required this.videoId,
+    required this.videoTitle,
+    this.source,
+    this.series,
+    required this.totalScreenshots,
+    this.generatedAt,
+    required this.language,
+    required this.outputDirectory,
+    required this.filenameFormat,
+  });
+
+  factory ManifestMetadata.fromJson(Map<String, dynamic> json) {
+    return ManifestMetadata(
+      videoUrl: json['video_url'] ?? '',
+      videoId: json['video_id'] ?? '',
+      videoTitle: json['video_title'] ?? '',
+      source: json['source'],
+      series: json['series'],
+      totalScreenshots: json['total_screenshots'] ?? 0,
+      generatedAt: json['generated_at'],
+      language: json['language'] ?? 'hr',
+      outputDirectory: json['output_directory'] ?? 'screenshots',
+      filenameFormat: json['filename_format'] ?? '{index:02d}_{timestamp_clean}_{slug}.png',
+    );
+  }
+}
+
+class Speaker {
+  final String fullName;
+  final String? role;
+  final String? colorCode;
+  final String slug;
+
+  Speaker({
+    required this.fullName,
+    this.role,
+    this.colorCode,
+    required this.slug,
+  });
+
+  factory Speaker.fromJson(Map<String, dynamic> json) {
+    return Speaker(
+      fullName: json['full_name'] ?? '',
+      role: json['role'],
+      colorCode: json['color_code'],
+      slug: json['slug'] ?? '',
+    );
+  }
+
+  Color get color {
+    if (colorCode == null) return Colors.grey;
+    try {
+      return Color(int.parse(colorCode!.replaceFirst('#', '0xFF')));
+    } catch (_) {
+      return Colors.grey;
+    }
+  }
+}
+
+class ScreenshotConfig {
+  final int id;
+  final String filename;
+  final String timestamp;
+  final int timestampSeconds;
+  final String? speakerId;
+  final String? chapter;
+  final String? sceneDescription;
+  final String captionHr;
+  final String? captionEn;
+  final String? slug;
+  final bool isPriority;
+  final int? priorityRank;
+  final List<String> tags;
+
+  ScreenshotConfig({
+    required this.id,
+    required this.filename,
+    required this.timestamp,
+    required this.timestampSeconds,
+    this.speakerId,
+    this.chapter,
+    this.sceneDescription,
+    required this.captionHr,
+    this.captionEn,
+    this.slug,
+    this.isPriority = false,
+    this.priorityRank,
+    this.tags = const [],
+  });
+
+  factory ScreenshotConfig.fromJson(Map<String, dynamic> json) {
+    return ScreenshotConfig(
+      id: json['id'] ?? 0,
+      filename: json['filename'] ?? '',
+      timestamp: json['timestamp'] ?? '00:00:00',
+      timestampSeconds: json['timestamp_seconds'] ?? 0,
+      speakerId: json['speaker_id'],
+      chapter: json['chapter'],
+      sceneDescription: json['scene_description'],
+      captionHr: json['caption_hr'] ?? '',
+      captionEn: json['caption_en'],
+      slug: json['slug'],
+      isPriority: json['is_priority'] ?? false,
+      priorityRank: json['priority_rank'],
+      tags: (json['tags'] as List?)?.cast<String>() ?? [],
+    );
+  }
+
+  Duration get duration => Duration(seconds: timestampSeconds);
+}
+
+class PriorityScreenshot {
+  final int rank;
+  final int id;
+  final String timestamp;
+  final String filename;
+  final String description;
+
+  PriorityScreenshot({
+    required this.rank,
+    required this.id,
+    required this.timestamp,
+    required this.filename,
+    required this.description,
+  });
+
+  factory PriorityScreenshot.fromJson(Map<String, dynamic> json) {
+    return PriorityScreenshot(
+      rank: json['rank'] ?? 0,
+      id: json['id'] ?? 0,
+      timestamp: json['timestamp'] ?? '',
+      filename: json['filename'] ?? '',
+      description: json['description'] ?? '',
+    );
+  }
+}
+
+class Chapter {
+  final int id;
+  final String title;
+  final String startTimestamp;
+  final String? endTimestamp;
+  final String? description;
+
+  Chapter({
+    required this.id,
+    required this.title,
+    required this.startTimestamp,
+    this.endTimestamp,
+    this.description,
+  });
+
+  factory Chapter.fromJson(Map<String, dynamic> json) {
+    return Chapter(
+      id: json['id'] ?? 0,
+      title: json['title'] ?? '',
+      startTimestamp: json['start_timestamp'] ?? '00:00:00',
+      endTimestamp: json['end_timestamp'],
+      description: json['description'],
+    );
+  }
+}
+
+// ============================================================================
+// App
+// ============================================================================
 
 class ZaScreenshotApp extends StatelessWidget {
   const ZaScreenshotApp({super.key});
@@ -72,122 +287,114 @@ class ZaScreenshotHome extends StatefulWidget {
 }
 
 class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
-  late final Player _player;
-  late final media_kit.VideoController _videoController;
+  Player? _player;
+  media_kit.VideoController? _videoController;
   final GlobalKey _repaintBoundaryKey = GlobalKey();
 
-  bool _isLoading = true;
+  // State
+  ScreenshotManifest? _manifest;
+  String? _configPath;
+  bool _isLoading = false;
   bool _isCapturing = false;
-  String _statusMessage = 'Initializing...';
+  String _statusMessage = 'Select a JSON config file to start';
   double _progress = 0.0;
   int _sourceWidth = 0;
   int _sourceHeight = 0;
   List<String> _capturedFiles = [];
-
-  // Debug state
-  String _debugInfo = '';
-  List<StreamSubscription> _subscriptions = [];
+  ScreenshotConfig? _currentScreenshot;
+  int _currentIndex = 0;
 
   @override
-  void initState() {
-    super.initState();
-    _player = Player(
-      configuration: PlayerConfiguration(
-        logLevel: MPVLogLevel.debug,
-      ),
-    );
-    _videoController = media_kit.VideoController(_player);
-    _setupDebugListeners();
-    _initializeVideo();
+  void dispose() {
+    _player?.dispose();
+    super.dispose();
   }
 
-  void _setupDebugListeners() {
-    print('[DEBUG] Setting up player stream listeners...');
+  Future<void> _pickConfigFile() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['json'],
+        dialogTitle: 'Select Screenshot Manifest JSON',
+      );
 
-    // Listen to player state changes
-    _subscriptions.add(_player.stream.playing.listen((playing) {
-      print('[DEBUG] Player playing: $playing');
-    }));
-
-    _subscriptions.add(_player.stream.completed.listen((completed) {
-      print('[DEBUG] Player completed: $completed');
-    }));
-
-    _subscriptions.add(_player.stream.position.listen((position) {
-      // Only log every 5 seconds to avoid spam
-      if (position.inSeconds % 5 == 0 && position.inMilliseconds % 1000 < 100) {
-        print('[DEBUG] Position: $position');
+      if (result != null && result.files.single.path != null) {
+        final path = result.files.single.path!;
+        await _loadConfig(path);
       }
-    }));
-
-    _subscriptions.add(_player.stream.duration.listen((duration) {
-      print('[DEBUG] Duration: $duration');
-    }));
-
-    _subscriptions.add(_player.stream.buffering.listen((buffering) {
-      print('[DEBUG] Buffering: $buffering');
-    }));
-
-    _subscriptions.add(_player.stream.buffer.listen((buffer) {
-      print('[DEBUG] Buffer: $buffer');
-    }));
-
-    _subscriptions.add(_player.stream.width.listen((width) {
-      print('[DEBUG] Video width from player: $width');
+    } catch (e) {
       setState(() {
-        _debugInfo = 'Player width: $width';
+        _statusMessage = 'Error picking file: $e';
       });
-    }));
+    }
+  }
 
-    _subscriptions.add(_player.stream.height.listen((height) {
-      print('[DEBUG] Video height from player: $height');
+  Future<void> _loadConfig(String path) async {
+    setState(() {
+      _isLoading = true;
+      _statusMessage = 'Loading config...';
+      _configPath = path;
+    });
+
+    try {
+      final file = File(path);
+      final content = await file.readAsString();
+      final json = jsonDecode(content) as Map<String, dynamic>;
+      final manifest = ScreenshotManifest.fromJson(json);
+
       setState(() {
-        _debugInfo = 'Player height: $height';
+        _manifest = manifest;
+        _statusMessage = 'Config loaded: ${manifest.metadata.videoTitle}';
       });
-    }));
 
-    _subscriptions.add(_player.stream.error.listen((error) {
-      print('[DEBUG] ERROR: $error');
-    }));
+      print('[CONFIG] Loaded manifest:');
+      print('  Video: ${manifest.metadata.videoTitle}');
+      print('  URL: ${manifest.metadata.videoUrl}');
+      print('  Screenshots: ${manifest.screenshots.length}');
+      print('  Speakers: ${manifest.speakers.length}');
 
-    _subscriptions.add(_player.stream.log.listen((log) {
-      print('[DEBUG] Log: ${log.level} - ${log.prefix}: ${log.text}');
-    }));
+      await _initializeVideo();
+    } catch (e, stackTrace) {
+      print('[ERROR] Failed to load config: $e');
+      print(stackTrace);
+      setState(() {
+        _isLoading = false;
+        _statusMessage = 'Error loading config: $e';
+      });
+    }
   }
 
   Future<void> _initializeVideo() async {
-    try {
-      setState(() {
-        _statusMessage = 'Fetching YouTube stream via yt-dlp...';
-      });
+    if (_manifest == null) return;
 
-      // Use yt-dlp to get a working stream URL (supports all qualities)
+    setState(() {
+      _statusMessage = 'Fetching video stream...';
+    });
+
+    try {
+      // Use yt-dlp to get stream URL
       print('[DEBUG] Using yt-dlp to fetch stream URL...');
 
-      // First, list available formats
-      final listResult = await Process.run('yt-dlp', ['-F', targetVideoUrl]);
-      print('[DEBUG] Available formats:\n${listResult.stdout}');
-
-      // Try to get 1080p (format 137), fallback to 720p (136), then 480p (135)
       String? streamUrl;
       int selectedFormat = 0;
 
       for (final format in [137, 136, 135, 134, 18]) {
         print('[DEBUG] Trying format $format...');
-        final result = await Process.run('yt-dlp', ['-f', '$format', '-g', targetVideoUrl]);
+        final result = await Process.run(
+          'yt-dlp',
+          ['-f', '$format', '-g', _manifest!.metadata.videoUrl],
+        );
 
         if (result.exitCode == 0 && (result.stdout as String).trim().isNotEmpty) {
           streamUrl = (result.stdout as String).trim();
           selectedFormat = format;
           print('[DEBUG] Got URL for format $format');
           break;
-        } else {
-          print('[DEBUG] Format $format failed: ${result.stderr}');
         }
       }
 
       if (streamUrl == null) {
-        throw Exception('Could not get any stream URL from yt-dlp');
+        throw Exception('Could not get stream URL from yt-dlp');
       }
 
       // Set resolution based on format
@@ -204,72 +411,46 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
           _sourceWidth = 854;
           _sourceHeight = 480;
           break;
-        case 134:
-          _sourceWidth = 640;
-          _sourceHeight = 360;
-          break;
-        case 18:
-          _sourceWidth = 640;
-          _sourceHeight = 360;
-          break;
         default:
-          _sourceWidth = 1920;
-          _sourceHeight = 1080;
+          _sourceWidth = 640;
+          _sourceHeight = 360;
       }
 
       print('[DEBUG] Selected format: $selectedFormat (${_sourceWidth}x$_sourceHeight)');
-      print('[DEBUG] Stream URL length: ${streamUrl.length} chars');
 
       setState(() {
         _statusMessage = 'Loading video (${_sourceWidth}x$_sourceHeight)...';
       });
 
-      print('[DEBUG] Opening media in player...');
-      await _player.open(Media(streamUrl));
-      print('[DEBUG] Media opened, waiting for playback to start...');
-
-      // Wait for video to be ready with timeout
-      print('[DEBUG] Waiting for player.stream.playing...');
-      await _player.stream.playing.firstWhere((playing) => playing).timeout(
-        const Duration(seconds: 30),
-        onTimeout: () {
-          print('[DEBUG] TIMEOUT waiting for playing state!');
-          return false;
-        },
+      // Initialize player
+      _player = Player(
+        configuration: PlayerConfiguration(logLevel: MPVLogLevel.warn),
       );
+      _videoController = media_kit.VideoController(_player!);
 
-      print('[DEBUG] Video started playing, now pausing...');
-      await _player.pause();
+      await _player!.open(Media(streamUrl));
+      await _player!.stream.playing.firstWhere((p) => p).timeout(
+            const Duration(seconds: 30),
+            onTimeout: () => false,
+          );
+      await _player!.pause();
 
-      // Wait for video dimensions to be available (indicates frame is decoded)
-      print('[DEBUG] Waiting for video dimensions...');
+      // Wait for dimensions
       int waitCount = 0;
-      while (_player.state.width == null && waitCount < 50) {
+      while (_player!.state.width == null && waitCount < 50) {
         await Future.delayed(const Duration(milliseconds: 100));
         waitCount++;
       }
-      print('[DEBUG] Waited ${waitCount * 100}ms for dimensions');
 
-      // Wait a bit more and check player state
-      await Future.delayed(const Duration(seconds: 2));
-
-      print('[DEBUG] After pause - checking player state:');
-      print('[DEBUG]   state.playing: ${_player.state.playing}');
-      print('[DEBUG]   state.position: ${_player.state.position}');
-      print('[DEBUG]   state.duration: ${_player.state.duration}');
-      print('[DEBUG]   state.width: ${_player.state.width}');
-      print('[DEBUG]   state.height: ${_player.state.height}');
-      print('[DEBUG]   state.buffering: ${_player.state.buffering}');
-      print('[DEBUG]   state.buffer: ${_player.state.buffer}');
+      await Future.delayed(const Duration(seconds: 1));
 
       setState(() {
         _isLoading = false;
-        _statusMessage = 'Ready to capture';
-        _debugInfo = 'Player: ${_player.state.width}x${_player.state.height}';
+        _statusMessage = 'Ready to capture ${_manifest!.screenshots.length} screenshots';
       });
     } catch (e, stackTrace) {
-      print('[DEBUG] ERROR in _initializeVideo: $e');
-      print('[DEBUG] Stack trace: $stackTrace');
+      print('[ERROR] Failed to initialize video: $e');
+      print(stackTrace);
       setState(() {
         _isLoading = false;
         _statusMessage = 'Error: $e';
@@ -278,105 +459,87 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
   }
 
   Future<void> _captureScreenshots() async {
-    if (_isCapturing || _sourceWidth == 0) return;
+    if (_manifest == null || _player == null || _isCapturing) return;
 
     setState(() {
       _isCapturing = true;
       _progress = 0.0;
       _capturedFiles = [];
-      _statusMessage = 'Starting capture...';
+      _currentIndex = 0;
     });
 
     try {
-      final downloadsDir = await _getDownloadsDirectory();
-      print('[DEBUG] Downloads directory: $downloadsDir');
+      // Determine output directory
+      final outputDir = await _getOutputDirectory();
+      print('[CAPTURE] Output directory: $outputDir');
 
-      for (int i = 0; i < captureTimestamps.length; i++) {
-        final timestamp = captureTimestamps[i];
+      // Ensure directory exists
+      final dir = Directory(outputDir);
+      if (!await dir.exists()) {
+        await dir.create(recursive: true);
+      }
+
+      final screenshots = _manifest!.screenshots;
+      final total = screenshots.length;
+
+      for (int i = 0; i < total; i++) {
+        final config = screenshots[i];
 
         setState(() {
-          _statusMessage = 'Seeking to ${_formatDuration(timestamp)}...';
-          _progress = (i / captureTimestamps.length);
+          _currentScreenshot = config;
+          _currentIndex = i + 1;
+          _progress = i / total;
+          _statusMessage = 'Capturing ${i + 1}/$total: ${config.timestamp}';
         });
 
-        print('[DEBUG] === Capturing frame $i at $timestamp ===');
+        print('[CAPTURE] === Screenshot ${i + 1}/$total ===');
+        print('  Timestamp: ${config.timestamp} (${config.timestampSeconds}s)');
+        print('  Filename: ${config.filename}');
+        print('  Caption: ${config.captionHr}');
 
         // Seek to position
-        print('[DEBUG] Seeking to $timestamp...');
-        await _player.seek(timestamp);
+        await _player!.seek(config.duration);
+        await _player!.play();
+        await Future.delayed(const Duration(seconds: 2));
 
-        // Play briefly to ensure frame is decoded
-        print('[DEBUG] Playing briefly to decode frame...');
-        await _player.play();
-
-        // Wait for seek to complete and frame to buffer
-        print('[DEBUG] Waiting for buffering...');
-        await Future.delayed(const Duration(seconds: 3));
-
-        // Wait for buffering to complete
+        // Wait for buffering
         int bufferWait = 0;
-        while (_player.state.buffering && bufferWait < 50) {
+        while (_player!.state.buffering && bufferWait < 30) {
           await Future.delayed(const Duration(milliseconds: 100));
           bufferWait++;
         }
-        print('[DEBUG] Buffering wait: ${bufferWait * 100}ms');
 
-        // Check current state
-        print('[DEBUG] After seek - player state:');
-        print('[DEBUG]   position: ${_player.state.position}');
-        print('[DEBUG]   buffering: ${_player.state.buffering}');
-        print('[DEBUG]   width: ${_player.state.width}');
-        print('[DEBUG]   height: ${_player.state.height}');
+        await _player!.pause();
+        await Future.delayed(const Duration(milliseconds: 500));
 
-        // Pause for capture
-        print('[DEBUG] Pausing for capture...');
-        await _player.pause();
-
-        // Extra wait to ensure frame is rendered
-        await Future.delayed(const Duration(seconds: 1));
-
-        setState(() {
-          _statusMessage = 'Capturing frame at ${_formatDuration(timestamp)}...';
-        });
-
-        // Capture the frame using RepaintBoundary
+        // Capture frame
         final boundary = _repaintBoundaryKey.currentContext?.findRenderObject()
             as RenderRepaintBoundary?;
 
         if (boundary == null) {
-          print('[DEBUG] ERROR: RepaintBoundary not found!');
+          print('[ERROR] RepaintBoundary not found');
           continue;
         }
 
-        print('[DEBUG] RepaintBoundary found, size: ${boundary.size}');
-        print('[DEBUG] Capturing with pixelRatio: $videoScaleFactor');
+        // Calculate pixel ratio to match source resolution
+        final boundarySize = boundary.size;
+        final pixelRatio = _sourceWidth / boundarySize.width;
 
-        // Capture at 4x scale to get full resolution
-        final ui.Image image = await boundary.toImage(pixelRatio: videoScaleFactor);
-        print('[DEBUG] Image captured: ${image.width}x${image.height}');
-
-        // Convert to PNG
+        final ui.Image image = await boundary.toImage(pixelRatio: pixelRatio);
         final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+
         if (byteData == null) {
-          print('[DEBUG] ERROR: Could not convert image to bytes');
+          print('[ERROR] Could not convert image to bytes');
           continue;
         }
-        print('[DEBUG] PNG byte data size: ${byteData.lengthInBytes} bytes');
-
-        // Generate filename
-        final filename = 'za_screenshot_${_formatFilename(timestamp)}.png';
-        final filePath = '$downloadsDir/$filename';
 
         // Save file
-        print('[DEBUG] Saving to: $filePath');
+        final filePath = '$outputDir/${config.filename}';
         final file = File(filePath);
         await file.writeAsBytes(byteData.buffer.asUint8List());
 
         _capturedFiles.add(filePath);
-
-        // Print verification info
-        print('[DEBUG] Saved: $filePath');
-        print('[DEBUG] Resolution: ${image.width} x ${image.height}');
+        print('[SAVED] $filePath (${image.width}x${image.height})');
 
         image.dispose();
       }
@@ -384,63 +547,39 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
       setState(() {
         _isCapturing = false;
         _progress = 1.0;
+        _currentScreenshot = null;
         _statusMessage = 'Capture complete! ${_capturedFiles.length} images saved.';
       });
 
       print('\n=== Capture Summary ===');
-      for (final path in _capturedFiles) {
-        print(path);
-      }
+      print('Total: ${_capturedFiles.length} screenshots');
+      print('Output: $outputDir');
+
     } catch (e, stackTrace) {
-      print('[DEBUG] ERROR in _captureScreenshots: $e');
-      print('[DEBUG] Stack trace: $stackTrace');
+      print('[ERROR] Capture failed: $e');
+      print(stackTrace);
       setState(() {
         _isCapturing = false;
-        _statusMessage = 'Error during capture: $e';
+        _statusMessage = 'Error: $e';
       });
     }
   }
 
-  Future<String> _getDownloadsDirectory() async {
-    if (Platform.isMacOS) {
-      final home = Platform.environment['HOME'];
-      return '$home/Downloads';
+  Future<String> _getOutputDirectory() async {
+    if (_manifest != null && _configPath != null) {
+      // Use directory relative to config file
+      final configDir = File(_configPath!).parent.path;
+      return '$configDir/${_manifest!.metadata.outputDirectory}';
     }
-    final dir = await getDownloadsDirectory();
-    return dir?.path ?? (await getApplicationDocumentsDirectory()).path;
-  }
-
-  String _formatDuration(Duration duration) {
-    final hours = duration.inHours;
-    final minutes = duration.inMinutes.remainder(60);
-    final seconds = duration.inSeconds.remainder(60);
-
-    if (hours > 0) {
-      return '${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
-    }
-    return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
-  }
-
-  String _formatFilename(Duration duration) {
-    final hours = duration.inHours;
-    final minutes = duration.inMinutes.remainder(60);
-    final seconds = duration.inSeconds.remainder(60);
-    return '${hours.toString().padLeft(2, '0')}_${minutes.toString().padLeft(2, '0')}_${seconds.toString().padLeft(2, '0')}';
-  }
-
-  @override
-  void dispose() {
-    for (final sub in _subscriptions) {
-      sub.cancel();
-    }
-    _player.dispose();
-    super.dispose();
+    // Fallback to Downloads
+    final home = Platform.environment['HOME'];
+    return '$home/Downloads/screenshots';
   }
 
   @override
   Widget build(BuildContext context) {
-    final displayWidth = _sourceWidth > 0 ? _sourceWidth / videoScaleFactor : 960.0;
-    final displayHeight = _sourceHeight > 0 ? _sourceHeight / videoScaleFactor : 540.0;
+    final displayWidth = _sourceWidth > 0 ? _sourceWidth / 4.0 : 480.0;
+    final displayHeight = _sourceHeight > 0 ? _sourceHeight / 4.0 : 270.0;
 
     return Scaffold(
       appBar: AppBar(
@@ -448,13 +587,20 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
           children: [
             Icon(Icons.screenshot_monitor, size: 28),
             SizedBox(width: 12),
-            Text(
-              'Za Screenshot',
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
+            Text('Za Screenshot', style: TextStyle(fontWeight: FontWeight.bold)),
           ],
         ),
         actions: [
+          if (_manifest != null)
+            Padding(
+              padding: const EdgeInsets.only(right: 16),
+              child: Center(
+                child: Text(
+                  '${_manifest!.screenshots.length} screenshots',
+                  style: TextStyle(color: Colors.grey[400], fontSize: 12),
+                ),
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.only(right: 16),
             child: Center(
@@ -470,96 +616,186 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
           ),
         ],
       ),
-      body: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              // Debug info
-              if (_debugInfo.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.orange.withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      'Debug: $_debugInfo',
-                      style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
-                    ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            // Config Section
+            if (_manifest == null) ...[
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(32),
+                  child: Column(
+                    children: [
+                      Icon(Icons.upload_file, size: 64, color: Colors.grey[600]),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'Select Screenshot Manifest',
+                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Choose a JSON file that defines screenshots to capture',
+                        style: TextStyle(color: Colors.grey[500]),
+                      ),
+                      const SizedBox(height: 24),
+                      ElevatedButton.icon(
+                        onPressed: _isLoading ? null : _pickConfigFile,
+                        icon: const Icon(Icons.folder_open),
+                        label: const Text('Select JSON File'),
+                      ),
+                    ],
                   ),
                 ),
-
-              // Video Player Card
+              ),
+            ] else ...[
+              // Metadata Card
               Card(
-                elevation: 8,
                 child: Padding(
                   padding: const EdgeInsets.all(16),
                   child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // Source info
-                      if (_sourceWidth > 0)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 12),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(Icons.videocam, size: 16, color: Colors.grey[400]),
-                              const SizedBox(width: 8),
-                              Text(
-                                'Source: ${_sourceWidth}x$_sourceHeight',
-                                style: TextStyle(color: Colors.grey[400], fontSize: 12),
+                      Row(
+                        children: [
+                          const Icon(Icons.movie, size: 20),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              _manifest!.metadata.videoTitle,
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
                               ),
-                              const SizedBox(width: 16),
-                              Icon(Icons.display_settings, size: 16, color: Colors.grey[400]),
-                              const SizedBox(width: 8),
-                              Text(
-                                'Display: ${displayWidth.toInt()}x${displayHeight.toInt()}',
-                                style: TextStyle(color: Colors.grey[400], fontSize: 12),
-                              ),
-                            ],
+                            ),
                           ),
-                        ),
-
-                      // Video with RepaintBoundary
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(12),
-                        child: RepaintBoundary(
-                          key: _repaintBoundaryKey,
-                          child: SizedBox(
-                            width: displayWidth,
-                            height: displayHeight,
-                            child: _isLoading
-                                ? Container(
-                                    color: const Color(0xFF2D2D44),
-                                    child: const Center(
-                                      child: CircularProgressIndicator(),
-                                    ),
-                                  )
-                                : media_kit.Video(
-                                    controller: _videoController,
-                                    controls: media_kit.NoVideoControls,
-                                  ),
+                          IconButton(
+                            icon: const Icon(Icons.close, size: 20),
+                            onPressed: () {
+                              setState(() {
+                                _manifest = null;
+                                _configPath = null;
+                                _player?.dispose();
+                                _player = null;
+                                _videoController = null;
+                                _statusMessage = 'Select a JSON config file to start';
+                              });
+                            },
                           ),
+                        ],
+                      ),
+                      if (_manifest!.metadata.source != null) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          _manifest!.metadata.source!,
+                          style: TextStyle(color: Colors.grey[500], fontSize: 12),
                         ),
+                      ],
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 4,
+                        children: [
+                          _buildInfoChip(Icons.photo_library, '${_manifest!.screenshots.length} shots'),
+                          _buildInfoChip(Icons.star, '${_manifest!.priorityScreenshots.length} priority'),
+                          _buildInfoChip(Icons.people, '${_manifest!.speakers.length} speakers'),
+                          if (_sourceWidth > 0)
+                            _buildInfoChip(Icons.high_quality, '${_sourceWidth}x$_sourceHeight'),
+                        ],
                       ),
                     ],
                   ),
                 ),
               ),
 
-              const SizedBox(height: 24),
+              const SizedBox(height: 16),
 
-              // Status Card
+              // Video Player
+              if (_videoController != null)
+                Card(
+                  elevation: 8,
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: RepaintBoundary(
+                            key: _repaintBoundaryKey,
+                            child: SizedBox(
+                              width: displayWidth,
+                              height: displayHeight,
+                              child: media_kit.Video(
+                                controller: _videoController!,
+                                controls: media_kit.NoVideoControls,
+                              ),
+                            ),
+                          ),
+                        ),
+                        if (_currentScreenshot != null) ...[
+                          const SizedBox(height: 12),
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.black26,
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 4,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: _getSpeakerColor(_currentScreenshot!.speakerId),
+                                        borderRadius: BorderRadius.circular(4),
+                                      ),
+                                      child: Text(
+                                        _currentScreenshot!.timestamp,
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    if (_currentScreenshot!.speakerId != null)
+                                      Text(
+                                        _getSpeakerName(_currentScreenshot!.speakerId!),
+                                        style: TextStyle(
+                                          color: _getSpeakerColor(_currentScreenshot!.speakerId),
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  _currentScreenshot!.captionHr,
+                                  style: const TextStyle(fontSize: 13),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+
+              const SizedBox(height: 16),
+
+              // Status & Progress Card
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(20),
                   child: Column(
                     children: [
-                      // Status message
                       Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
@@ -581,12 +817,10 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
                           ),
                         ],
                       ),
-
-                      // Progress bar
                       if (_isCapturing) ...[
                         const SizedBox(height: 16),
                         SizedBox(
-                          width: 300,
+                          width: 400,
                           child: LinearProgressIndicator(
                             value: _progress,
                             backgroundColor: Colors.grey[800],
@@ -595,52 +829,18 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          '${(_progress * 100).toInt()}%',
+                          '$_currentIndex / ${_manifest!.screenshots.length}',
                           style: TextStyle(color: Colors.grey[500], fontSize: 12),
                         ),
                       ],
-
-                      // Timestamps info
-                      if (!_isCapturing && !_isLoading && _sourceWidth > 0) ...[
-                        const SizedBox(height: 16),
-                        Text(
-                          'Timestamps to capture:',
-                          style: TextStyle(color: Colors.grey[500], fontSize: 12),
-                        ),
-                        const SizedBox(height: 8),
-                        Wrap(
-                          spacing: 8,
-                          children: captureTimestamps
-                              .map((ts) => Chip(
-                                    label: Text(_formatDuration(ts)),
-                                    backgroundColor: const Color(0xFF2D2D44),
-                                    labelStyle: const TextStyle(fontSize: 12),
-                                  ))
-                              .toList(),
-                        ),
-                      ],
-
-                      // Captured files list
-                      if (_capturedFiles.isNotEmpty) ...[
+                      if (_capturedFiles.isNotEmpty && !_isCapturing) ...[
                         const SizedBox(height: 16),
                         const Divider(),
                         const SizedBox(height: 8),
                         Text(
-                          'Saved to Downloads:',
-                          style: TextStyle(color: Colors.grey[400], fontSize: 12),
+                          'Output: ${_capturedFiles.length} files saved',
+                          style: TextStyle(color: Colors.green[400], fontSize: 12),
                         ),
-                        const SizedBox(height: 8),
-                        ...(_capturedFiles.map((path) => Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 2),
-                              child: Text(
-                                path.split('/').last,
-                                style: TextStyle(
-                                  color: Colors.green[400],
-                                  fontSize: 11,
-                                  fontFamily: 'monospace',
-                                ),
-                              ),
-                            ))),
                       ],
                     ],
                   ),
@@ -649,27 +849,69 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
 
               const SizedBox(height: 24),
 
-              // Capture Button
-              ElevatedButton.icon(
-                onPressed: (_isLoading || _isCapturing) ? null : _captureScreenshots,
-                icon: const Icon(Icons.camera_alt),
-                label: Text(_isCapturing ? 'Capturing...' : 'Capture Screenshots'),
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 20),
-                ),
-              ),
-
-              const SizedBox(height: 16),
-
-              // Help text
-              Text(
-                'Output: PNG images (${(_sourceWidth > 0 ? _sourceWidth : 3840)}x${(_sourceHeight > 0 ? _sourceHeight : 2160)})',
-                style: TextStyle(color: Colors.grey[600], fontSize: 11),
+              // Action Buttons
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  ElevatedButton.icon(
+                    onPressed: (_isLoading || _isCapturing || _player == null)
+                        ? null
+                        : _captureScreenshots,
+                    icon: const Icon(Icons.camera_alt),
+                    label: Text(_isCapturing ? 'Capturing...' : 'Capture All Screenshots'),
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 20),
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  OutlinedButton.icon(
+                    onPressed: _isLoading || _isCapturing ? null : _pickConfigFile,
+                    icon: const Icon(Icons.folder_open),
+                    label: const Text('Load Different Config'),
+                  ),
+                ],
               ),
             ],
-          ),
+
+            // Loading indicator
+            if (_isLoading && _manifest == null)
+              const Padding(
+                padding: EdgeInsets.all(32),
+                child: CircularProgressIndicator(),
+              ),
+          ],
         ),
       ),
     );
+  }
+
+  Widget _buildInfoChip(IconData icon, String label) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.white10,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: Colors.grey[400]),
+          const SizedBox(width: 6),
+          Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[300])),
+        ],
+      ),
+    );
+  }
+
+  Color _getSpeakerColor(String? speakerId) {
+    if (speakerId == null || _manifest == null) return Colors.grey;
+    final speaker = _manifest!.speakers[speakerId];
+    return speaker?.color ?? Colors.grey;
+  }
+
+  String _getSpeakerName(String speakerId) {
+    if (_manifest == null) return speakerId;
+    final speaker = _manifest!.speakers[speakerId];
+    return speaker?.fullName ?? speakerId;
   }
 }

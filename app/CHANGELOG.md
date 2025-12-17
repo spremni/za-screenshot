@@ -5,6 +5,68 @@ All notable changes to the "Za Screenshot" project will be documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2025-12-17
+
+### Added
+
+- **JSON Manifest Support** - structured configuration for batch screenshot capture
+  - Load screenshot definitions from JSON config files
+  - Support for YouTube Screenshot Schema with metadata, speakers, and chapters
+  - File picker integration for easy JSON file selection
+
+- **Rich Metadata Display**
+  - Video title, source, and series information
+  - Speaker information with color-coded identification
+  - Caption display during capture (Croatian language support)
+  - Priority screenshot indicators
+  - Chapter/section organization
+
+- **Enhanced Capture Workflow**
+  - Batch capture of multiple screenshots from single JSON config
+  - Output directory configurable via JSON (`output_directory` field)
+  - Filename from JSON config (`filename` field per screenshot)
+  - Progress indicator showing current/total screenshots
+  - Speaker name and caption displayed during capture
+
+### JSON Schema Features
+
+```json
+{
+  "metadata": {
+    "video_url": "YouTube URL",
+    "video_title": "Video title",
+    "total_screenshots": 47,
+    "output_directory": "screenshots"
+  },
+  "speakers": { ... },
+  "screenshots": [
+    {
+      "id": 1,
+      "filename": "01_000018_intro.png",
+      "timestamp": "00:00:18",
+      "timestamp_seconds": 18,
+      "speaker_id": "speaker_key",
+      "caption_hr": "Caption text"
+    }
+  ],
+  "priority_screenshots": [ ... ],
+  "chapters": [ ... ]
+}
+```
+
+### Changed
+
+- Replaced hardcoded timestamps with JSON-driven configuration
+- Output directory now relative to config file location
+- Removed `youtube_explode_dart` dependency (using yt-dlp exclusively)
+- Removed `path_provider` dependency
+
+### Dependencies
+
+- Added `file_picker: ^8.1.6` - Native file picker dialog
+
+---
+
 ## [1.1.0] - 2025-12-17
 
 ### Added
