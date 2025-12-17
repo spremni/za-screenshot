@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
@@ -96,6 +97,14 @@ class ManifestMetadata {
       filenameFormat: json['filename_format'] ?? '{index:02d}_{timestamp_clean}_{slug}.png',
     );
   }
+
+  String get sanitizedTitle {
+    return videoTitle
+        .replaceAll(RegExp(r'[<>:"/\\|?*]'), '_')
+        .replaceAll(RegExp(r'\s+'), '_')
+        .replaceAll(RegExp(r'_+'), '_')
+        .trim();
+  }
 }
 
 class Speaker {
@@ -130,6 +139,8 @@ class Speaker {
   }
 }
 
+enum ScreenshotStatus { pending, inProgress, completed, failed }
+
 class ScreenshotConfig {
   final int id;
   final String filename;
@@ -144,6 +155,10 @@ class ScreenshotConfig {
   final bool isPriority;
   final int? priorityRank;
   final List<String> tags;
+
+  // Runtime state
+  ScreenshotStatus status = ScreenshotStatus.pending;
+  Uint8List? thumbnailBytes;
 
   ScreenshotConfig({
     required this.id,
@@ -290,24 +305,71 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
   Player? _player;
   media_kit.VideoController? _videoController;
   final GlobalKey _repaintBoundaryKey = GlobalKey();
+  final ScrollController _queueScrollController = ScrollController();
 
   // State
   ScreenshotManifest? _manifest;
   String? _configPath;
+  String? _outputDirectory;
   bool _isLoading = false;
   bool _isCapturing = false;
+  bool _capturePaused = false;
+  int _pausedAtIndex = -1;
   String _statusMessage = 'Select a JSON config file to start';
-  double _progress = 0.0;
   int _sourceWidth = 0;
   int _sourceHeight = 0;
-  List<String> _capturedFiles = [];
-  ScreenshotConfig? _currentScreenshot;
-  int _currentIndex = 0;
+  int _currentIndex = -1;
 
   @override
   void dispose() {
     _player?.dispose();
+    _queueScrollController.dispose();
     super.dispose();
+  }
+
+  // Handle tap on queue item - seek to timestamp and pause capturing
+  Future<void> _onQueueItemTap(ScreenshotConfig config, int index) async {
+    if (_player == null) return;
+
+    // If capturing is in progress, pause it
+    if (_isCapturing && !_capturePaused) {
+      setState(() {
+        _capturePaused = true;
+        _pausedAtIndex = _currentIndex;
+        _statusMessage = 'Paused at screenshot ${_pausedAtIndex + 1}. Click Continue to resume.';
+      });
+    }
+
+    // Seek to the timestamp
+    print('[MANUAL] Seeking to ${config.timestamp} (${config.timestampSeconds}s)');
+    await _player!.pause();
+    await _player!.seek(config.duration);
+    await Future.delayed(const Duration(milliseconds: 300));
+
+    // Play briefly to decode the frame
+    await _player!.play();
+    await Future.delayed(const Duration(milliseconds: 500));
+    await _player!.pause();
+
+    setState(() {
+      _currentIndex = index;
+      if (!_isCapturing) {
+        _statusMessage = 'Viewing: ${config.timestamp} - ${config.captionHr}';
+      }
+    });
+  }
+
+  // Continue capturing from where it was paused
+  Future<void> _continueCapturing() async {
+    if (!_capturePaused || _pausedAtIndex < 0) return;
+
+    setState(() {
+      _capturePaused = false;
+      _statusMessage = 'Resuming capture...';
+    });
+
+    // Resume from pausedAtIndex
+    await _captureScreenshotsFromIndex(_pausedAtIndex);
   }
 
   Future<void> _pickConfigFile() async {
@@ -342,6 +404,12 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
       final json = jsonDecode(content) as Map<String, dynamic>;
       final manifest = ScreenshotManifest.fromJson(json);
 
+      // Reset all screenshot statuses
+      for (final screenshot in manifest.screenshots) {
+        screenshot.status = ScreenshotStatus.pending;
+        screenshot.thumbnailBytes = null;
+      }
+
       setState(() {
         _manifest = manifest;
         _statusMessage = 'Config loaded: ${manifest.metadata.videoTitle}';
@@ -351,7 +419,6 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
       print('  Video: ${manifest.metadata.videoTitle}');
       print('  URL: ${manifest.metadata.videoUrl}');
       print('  Screenshots: ${manifest.screenshots.length}');
-      print('  Speakers: ${manifest.speakers.length}');
 
       await _initializeVideo();
     } catch (e, stackTrace) {
@@ -372,7 +439,6 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
     });
 
     try {
-      // Use yt-dlp to get stream URL
       print('[DEBUG] Using yt-dlp to fetch stream URL...');
 
       String? streamUrl;
@@ -397,7 +463,6 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
         throw Exception('Could not get stream URL from yt-dlp');
       }
 
-      // Set resolution based on format
       switch (selectedFormat) {
         case 137:
           _sourceWidth = 1920;
@@ -422,7 +487,6 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
         _statusMessage = 'Loading video (${_sourceWidth}x$_sourceHeight)...';
       });
 
-      // Initialize player
       _player = Player(
         configuration: PlayerConfiguration(logLevel: MPVLogLevel.warn),
       );
@@ -435,7 +499,6 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
           );
       await _player!.pause();
 
-      // Wait for dimensions
       int waitCount = 0;
       while (_player!.state.width == null && waitCount < 50) {
         await Future.delayed(const Duration(milliseconds: 100));
@@ -458,122 +521,272 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
     }
   }
 
+  Future<String> _createOutputDirectory() async {
+    final home = Platform.environment['HOME'];
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final sanitizedTitle = _manifest!.metadata.sanitizedTitle;
+    final dirName = '${sanitizedTitle}_$timestamp';
+    final path = '$home/Downloads/$dirName';
+
+    final dir = Directory(path);
+    await dir.create(recursive: true);
+
+    print('[OUTPUT] Created directory: $path');
+    return path;
+  }
+
   Future<void> _captureScreenshots() async {
     if (_manifest == null || _player == null || _isCapturing) return;
 
+    // Reset pause state
+    setState(() {
+      _capturePaused = false;
+      _pausedAtIndex = -1;
+    });
+
+    // Create output directory for new capture session
+    _outputDirectory = await _createOutputDirectory();
+    print('[CAPTURE] Output directory: $_outputDirectory');
+
+    await _captureScreenshotsFromIndex(0);
+  }
+
+  Future<void> _captureScreenshotsFromIndex(int startIndex) async {
+    if (_manifest == null || _player == null) return;
+
     setState(() {
       _isCapturing = true;
-      _progress = 0.0;
-      _capturedFiles = [];
-      _currentIndex = 0;
+      _currentIndex = startIndex;
+      _statusMessage = 'Starting capture...';
     });
 
     try {
-      // Determine output directory
-      final outputDir = await _getOutputDirectory();
-      print('[CAPTURE] Output directory: $outputDir');
-
-      // Ensure directory exists
-      final dir = Directory(outputDir);
-      if (!await dir.exists()) {
-        await dir.create(recursive: true);
-      }
-
       final screenshots = _manifest!.screenshots;
       final total = screenshots.length;
 
-      for (int i = 0; i < total; i++) {
+      for (int i = startIndex; i < total; i++) {
+        // Check if paused
+        if (_capturePaused) {
+          print('[CAPTURE] Paused by user at index $i');
+          return;
+        }
+
         final config = screenshots[i];
 
         setState(() {
-          _currentScreenshot = config;
-          _currentIndex = i + 1;
-          _progress = i / total;
+          config.status = ScreenshotStatus.inProgress;
+          _currentIndex = i;
           _statusMessage = 'Capturing ${i + 1}/$total: ${config.timestamp}';
         });
+
+        // Scroll to current item
+        _scrollToCurrentItem(i);
 
         print('[CAPTURE] === Screenshot ${i + 1}/$total ===');
         print('  Timestamp: ${config.timestamp} (${config.timestampSeconds}s)');
         print('  Filename: ${config.filename}');
-        print('  Caption: ${config.captionHr}');
 
-        // Seek to position
-        await _player!.seek(config.duration);
-        await _player!.play();
-        await Future.delayed(const Duration(seconds: 2));
+        try {
+          // IMPROVED SEEKING LOGIC v2 - ensures frame texture is actually updated
+          final targetPosition = config.duration;
+          final targetMs = targetPosition.inMilliseconds;
 
-        // Wait for buffering
-        int bufferWait = 0;
-        while (_player!.state.buffering && bufferWait < 30) {
-          await Future.delayed(const Duration(milliseconds: 100));
-          bufferWait++;
+          // 1. Pause first, then seek
+          print('[SEEK] Pausing and seeking to ${config.timestampSeconds}s...');
+          await _player!.pause();
+          await Future.delayed(const Duration(milliseconds: 200));
+          await _player!.seek(targetPosition);
+          await Future.delayed(const Duration(milliseconds: 500));
+
+          // 2. Start playback to force frame decode
+          print('[PLAY] Starting playback to decode frames...');
+          await _player!.play();
+
+          // 3. Wait for position to reach and PASS target (ensures frame was rendered)
+          print('[SEEK] Waiting for position to reach target...');
+          int seekAttempts = 0;
+          const maxSeekAttempts = 150; // 15 seconds max
+          Duration? lastPosition;
+          int samePositionCount = 0;
+          bool targetReached = false;
+
+          while (seekAttempts < maxSeekAttempts) {
+            final currentPos = _player!.state.position;
+            final currentMs = currentPos.inMilliseconds;
+
+            // Track if position is changing (indicates frames are rendering)
+            if (lastPosition != null && currentPos == lastPosition) {
+              samePositionCount++;
+            } else {
+              samePositionCount = 0;
+            }
+            lastPosition = currentPos;
+
+            // Accept when:
+            // 1. Position is at or past target (within 500ms window past target is OK)
+            // 2. OR position has reached target and playback has advanced past it
+            if (currentMs >= targetMs && currentMs < targetMs + 3000) {
+              if (!targetReached) {
+                print('[SEEK] Position reached target: $currentPos');
+                targetReached = true;
+              }
+              // Wait a bit longer to ensure the frame at this position is rendered
+              // (let video play for 1-2 more seconds so texture definitely updates)
+              if (currentMs > targetMs + 500) {
+                print('[SEEK] Position advanced past target: $currentPos');
+                break;
+              }
+            }
+
+            // If stuck at same position for too long, something is wrong
+            if (samePositionCount > 20) {
+              print('[SEEK] WARNING: Position stuck at $currentPos, breaking out');
+              break;
+            }
+
+            await Future.delayed(const Duration(milliseconds: 100));
+            seekAttempts++;
+          }
+
+          // 4. Wait for buffering to complete
+          print('[BUFFER] Waiting for buffer...');
+          int bufferWait = 0;
+          while (_player!.state.buffering && bufferWait < 50) {
+            await Future.delayed(const Duration(milliseconds: 100));
+            bufferWait++;
+          }
+          print('[BUFFER] Buffer wait: ${bufferWait * 100}ms');
+
+          // 5. If position was stuck, force a different approach
+          if (samePositionCount >= 20) {
+            print('[RETRY] Position was stuck, trying seek to before target...');
+            // Seek to 3 seconds before target and play forward
+            final beforeTarget = Duration(milliseconds: targetMs - 3000);
+            await _player!.seek(beforeTarget > Duration.zero ? beforeTarget : Duration.zero);
+            await Future.delayed(const Duration(milliseconds: 500));
+            await _player!.play();
+
+            // Wait until we pass target
+            int retryAttempts = 0;
+            while (retryAttempts < 100) {
+              final pos = _player!.state.position.inMilliseconds;
+              if (pos >= targetMs) {
+                print('[RETRY] Position now at: ${_player!.state.position}');
+                break;
+              }
+              await Future.delayed(const Duration(milliseconds: 100));
+              retryAttempts++;
+            }
+          }
+
+          // 6. Pause for clean capture (don't seek back, just capture current frame)
+          await _player!.pause();
+
+          // 7. Wait for Flutter to complete pending frames
+          await Future.delayed(const Duration(milliseconds: 500));
+
+          // Force a setState to trigger repaint
+          setState(() {});
+          await Future.delayed(const Duration(milliseconds: 200));
+
+          // 8. Verify position
+          print('[VERIFY] Final position: ${_player!.state.position}');
+
+          // 10. Capture frame
+          final boundary = _repaintBoundaryKey.currentContext?.findRenderObject()
+              as RenderRepaintBoundary?;
+
+          if (boundary == null) {
+            throw Exception('RepaintBoundary not found');
+          }
+
+          final boundarySize = boundary.size;
+          final pixelRatio = _sourceWidth / boundarySize.width;
+
+          final ui.Image image = await boundary.toImage(pixelRatio: pixelRatio);
+          final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+
+          if (byteData == null) {
+            throw Exception('Could not convert image to bytes');
+          }
+
+          // Save file
+          final filePath = '$_outputDirectory/${config.filename}';
+          final file = File(filePath);
+          await file.writeAsBytes(byteData.buffer.asUint8List());
+
+          // Generate thumbnail for queue display
+          final thumbnailImage = await boundary.toImage(pixelRatio: 0.5);
+          final thumbnailData = await thumbnailImage.toByteData(format: ui.ImageByteFormat.png);
+
+          setState(() {
+            config.status = ScreenshotStatus.completed;
+            if (thumbnailData != null) {
+              config.thumbnailBytes = thumbnailData.buffer.asUint8List();
+            }
+          });
+
+          print('[SAVED] $filePath (${image.width}x${image.height})');
+
+          image.dispose();
+          thumbnailImage.dispose();
+
+        } catch (e) {
+          print('[ERROR] Failed to capture screenshot ${i + 1}: $e');
+          setState(() {
+            config.status = ScreenshotStatus.failed;
+          });
         }
 
-        await _player!.pause();
+        // Small delay between captures
         await Future.delayed(const Duration(milliseconds: 500));
-
-        // Capture frame
-        final boundary = _repaintBoundaryKey.currentContext?.findRenderObject()
-            as RenderRepaintBoundary?;
-
-        if (boundary == null) {
-          print('[ERROR] RepaintBoundary not found');
-          continue;
-        }
-
-        // Calculate pixel ratio to match source resolution
-        final boundarySize = boundary.size;
-        final pixelRatio = _sourceWidth / boundarySize.width;
-
-        final ui.Image image = await boundary.toImage(pixelRatio: pixelRatio);
-        final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-
-        if (byteData == null) {
-          print('[ERROR] Could not convert image to bytes');
-          continue;
-        }
-
-        // Save file
-        final filePath = '$outputDir/${config.filename}';
-        final file = File(filePath);
-        await file.writeAsBytes(byteData.buffer.asUint8List());
-
-        _capturedFiles.add(filePath);
-        print('[SAVED] $filePath (${image.width}x${image.height})');
-
-        image.dispose();
       }
 
-      setState(() {
-        _isCapturing = false;
-        _progress = 1.0;
-        _currentScreenshot = null;
-        _statusMessage = 'Capture complete! ${_capturedFiles.length} images saved.';
-      });
+      // Only show completion if not paused
+      if (!_capturePaused) {
+        final completed = screenshots.where((s) => s.status == ScreenshotStatus.completed).length;
+        final failed = screenshots.where((s) => s.status == ScreenshotStatus.failed).length;
 
-      print('\n=== Capture Summary ===');
-      print('Total: ${_capturedFiles.length} screenshots');
-      print('Output: $outputDir');
+        setState(() {
+          _isCapturing = false;
+          _currentIndex = -1;
+          _pausedAtIndex = -1;
+          _statusMessage = 'Capture complete! $completed saved, $failed failed.';
+        });
+
+        print('\n=== Capture Summary ===');
+        print('Total: $completed completed, $failed failed');
+        print('Output: $_outputDirectory');
+      }
 
     } catch (e, stackTrace) {
       print('[ERROR] Capture failed: $e');
       print(stackTrace);
       setState(() {
         _isCapturing = false;
+        _capturePaused = false;
         _statusMessage = 'Error: $e';
       });
     }
   }
 
-  Future<String> _getOutputDirectory() async {
-    if (_manifest != null && _configPath != null) {
-      // Use directory relative to config file
-      final configDir = File(_configPath!).parent.path;
-      return '$configDir/${_manifest!.metadata.outputDirectory}';
-    }
-    // Fallback to Downloads
-    final home = Platform.environment['HOME'];
-    return '$home/Downloads/screenshots';
+  void _scrollToCurrentItem(int index) {
+    if (!_queueScrollController.hasClients) return;
+
+    const itemHeight = 80.0;
+    final targetOffset = index * itemHeight;
+    final maxOffset = _queueScrollController.position.maxScrollExtent;
+    final viewportHeight = _queueScrollController.position.viewportDimension;
+
+    // Center the item if possible
+    final centeredOffset = targetOffset - (viewportHeight / 2) + (itemHeight / 2);
+    final clampedOffset = centeredOffset.clamp(0.0, maxOffset);
+
+    _queueScrollController.animateTo(
+      clampedOffset,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeInOut,
+    );
   }
 
   @override
@@ -616,270 +829,527 @@ class _ZaScreenshotHomeState extends State<ZaScreenshotHome> {
           ),
         ],
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            // Config Section
-            if (_manifest == null) ...[
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(32),
-                  child: Column(
-                    children: [
-                      Icon(Icons.upload_file, size: 64, color: Colors.grey[600]),
-                      const SizedBox(height: 16),
-                      const Text(
-                        'Select Screenshot Manifest',
-                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Choose a JSON file that defines screenshots to capture',
-                        style: TextStyle(color: Colors.grey[500]),
-                      ),
-                      const SizedBox(height: 24),
-                      ElevatedButton.icon(
-                        onPressed: _isLoading ? null : _pickConfigFile,
-                        icon: const Icon(Icons.folder_open),
-                        label: const Text('Select JSON File'),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ] else ...[
-              // Metadata Card
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          const Icon(Icons.movie, size: 20),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              _manifest!.metadata.videoTitle,
-                              style: const TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.close, size: 20),
-                            onPressed: () {
-                              setState(() {
-                                _manifest = null;
-                                _configPath = null;
-                                _player?.dispose();
-                                _player = null;
-                                _videoController = null;
-                                _statusMessage = 'Select a JSON config file to start';
-                              });
-                            },
-                          ),
-                        ],
-                      ),
-                      if (_manifest!.metadata.source != null) ...[
-                        const SizedBox(height: 4),
-                        Text(
-                          _manifest!.metadata.source!,
-                          style: TextStyle(color: Colors.grey[500], fontSize: 12),
-                        ),
-                      ],
-                      const SizedBox(height: 12),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 4,
-                        children: [
-                          _buildInfoChip(Icons.photo_library, '${_manifest!.screenshots.length} shots'),
-                          _buildInfoChip(Icons.star, '${_manifest!.priorityScreenshots.length} priority'),
-                          _buildInfoChip(Icons.people, '${_manifest!.speakers.length} speakers'),
-                          if (_sourceWidth > 0)
-                            _buildInfoChip(Icons.high_quality, '${_sourceWidth}x$_sourceHeight'),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
+      body: _manifest == null ? _buildConfigPicker() : _buildMainContent(displayWidth, displayHeight),
+    );
+  }
 
+  Widget _buildConfigPicker() {
+    return Center(
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.upload_file, size: 64, color: Colors.grey[600]),
               const SizedBox(height: 16),
-
-              // Video Player
-              if (_videoController != null)
-                Card(
-                  elevation: 8,
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      children: [
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(12),
-                          child: RepaintBoundary(
-                            key: _repaintBoundaryKey,
-                            child: SizedBox(
-                              width: displayWidth,
-                              height: displayHeight,
-                              child: media_kit.Video(
-                                controller: _videoController!,
-                                controls: media_kit.NoVideoControls,
-                              ),
-                            ),
-                          ),
-                        ),
-                        if (_currentScreenshot != null) ...[
-                          const SizedBox(height: 12),
-                          Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: Colors.black26,
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 8,
-                                        vertical: 4,
-                                      ),
-                                      decoration: BoxDecoration(
-                                        color: _getSpeakerColor(_currentScreenshot!.speakerId),
-                                        borderRadius: BorderRadius.circular(4),
-                                      ),
-                                      child: Text(
-                                        _currentScreenshot!.timestamp,
-                                        style: const TextStyle(
-                                          fontWeight: FontWeight.bold,
-                                          fontSize: 12,
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    if (_currentScreenshot!.speakerId != null)
-                                      Text(
-                                        _getSpeakerName(_currentScreenshot!.speakerId!),
-                                        style: TextStyle(
-                                          color: _getSpeakerColor(_currentScreenshot!.speakerId),
-                                          fontWeight: FontWeight.w500,
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                                const SizedBox(height: 8),
-                                Text(
-                                  _currentScreenshot!.captionHr,
-                                  style: const TextStyle(fontSize: 13),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                ),
-
-              const SizedBox(height: 16),
-
-              // Status & Progress Card
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    children: [
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          if (_isLoading || _isCapturing)
-                            const Padding(
-                              padding: EdgeInsets.only(right: 12),
-                              child: SizedBox(
-                                width: 16,
-                                height: 16,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              ),
-                            ),
-                          Flexible(
-                            child: Text(
-                              _statusMessage,
-                              style: const TextStyle(fontSize: 14),
-                              textAlign: TextAlign.center,
-                            ),
-                          ),
-                        ],
-                      ),
-                      if (_isCapturing) ...[
-                        const SizedBox(height: 16),
-                        SizedBox(
-                          width: 400,
-                          child: LinearProgressIndicator(
-                            value: _progress,
-                            backgroundColor: Colors.grey[800],
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          '$_currentIndex / ${_manifest!.screenshots.length}',
-                          style: TextStyle(color: Colors.grey[500], fontSize: 12),
-                        ),
-                      ],
-                      if (_capturedFiles.isNotEmpty && !_isCapturing) ...[
-                        const SizedBox(height: 16),
-                        const Divider(),
-                        const SizedBox(height: 8),
-                        Text(
-                          'Output: ${_capturedFiles.length} files saved',
-                          style: TextStyle(color: Colors.green[400], fontSize: 12),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
+              const Text(
+                'Select Screenshot Manifest',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
               ),
-
+              const SizedBox(height: 8),
+              Text(
+                'Choose a JSON file that defines screenshots to capture',
+                style: TextStyle(color: Colors.grey[500]),
+              ),
               const SizedBox(height: 24),
+              ElevatedButton.icon(
+                onPressed: _isLoading ? null : _pickConfigFile,
+                icon: const Icon(Icons.folder_open),
+                label: const Text('Select JSON File'),
+              ),
+              if (_isLoading) ...[
+                const SizedBox(height: 24),
+                const CircularProgressIndicator(),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 
-              // Action Buttons
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  ElevatedButton.icon(
-                    onPressed: (_isLoading || _isCapturing || _player == null)
-                        ? null
-                        : _captureScreenshots,
-                    icon: const Icon(Icons.camera_alt),
-                    label: Text(_isCapturing ? 'Capturing...' : 'Capture All Screenshots'),
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 20),
+  Widget _buildMainContent(double displayWidth, double displayHeight) {
+    return Row(
+      children: [
+        // Left side - Video and controls
+        Expanded(
+          flex: 3,
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              children: [
+                // Metadata Card
+                _buildMetadataCard(),
+
+                const SizedBox(height: 16),
+
+                // Video Player
+                if (_videoController != null)
+                  Card(
+                    elevation: 8,
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        children: [
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(12),
+                            child: RepaintBoundary(
+                              key: _repaintBoundaryKey,
+                              child: SizedBox(
+                                width: displayWidth,
+                                height: displayHeight,
+                                child: media_kit.Video(
+                                  controller: _videoController!,
+                                  controls: media_kit.NoVideoControls,
+                                ),
+                              ),
+                            ),
+                          ),
+                          if (_currentIndex >= 0 && _currentIndex < _manifest!.screenshots.length)
+                            _buildCurrentCaptionCard(_manifest!.screenshots[_currentIndex]),
+                        ],
+                      ),
                     ),
                   ),
-                  const SizedBox(width: 16),
-                  OutlinedButton.icon(
-                    onPressed: _isLoading || _isCapturing ? null : _pickConfigFile,
-                    icon: const Icon(Icons.folder_open),
-                    label: const Text('Load Different Config'),
+
+                const SizedBox(height: 16),
+
+                // Status & Controls
+                _buildStatusCard(),
+
+                const SizedBox(height: 16),
+
+                // Action Buttons
+                _buildActionButtons(),
+              ],
+            ),
+          ),
+        ),
+
+        // Right side - Screenshot Queue
+        Container(
+          width: 320,
+          decoration: BoxDecoration(
+            color: const Color(0xFF151520),
+            border: Border(
+              left: BorderSide(color: Colors.grey[800]!, width: 1),
+            ),
+          ),
+          child: Column(
+            children: [
+              // Queue Header
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E1E2E),
+                  border: Border(
+                    bottom: BorderSide(color: Colors.grey[800]!, width: 1),
                   ),
-                ],
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.queue, size: 20),
+                    const SizedBox(width: 8),
+                    const Text(
+                      'Screenshot Queue',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const Spacer(),
+                    _buildQueueStats(),
+                  ],
+                ),
+              ),
+
+              // Queue List
+              Expanded(
+                child: ListView.builder(
+                  controller: _queueScrollController,
+                  itemCount: _manifest!.screenshots.length,
+                  itemBuilder: (context, index) {
+                    return _buildQueueItem(_manifest!.screenshots[index], index);
+                  },
+                ),
               ),
             ],
+          ),
+        ),
+      ],
+    );
+  }
 
-            // Loading indicator
-            if (_isLoading && _manifest == null)
-              const Padding(
-                padding: EdgeInsets.all(32),
-                child: CircularProgressIndicator(),
+  Widget _buildMetadataCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.movie, size: 20),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _manifest!.metadata.videoTitle,
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, size: 20),
+                  onPressed: _isCapturing
+                      ? null
+                      : () {
+                          setState(() {
+                            _manifest = null;
+                            _configPath = null;
+                            _outputDirectory = null;
+                            _player?.dispose();
+                            _player = null;
+                            _videoController = null;
+                            _statusMessage = 'Select a JSON config file to start';
+                          });
+                        },
+                ),
+              ],
+            ),
+            if (_manifest!.metadata.source != null) ...[
+              const SizedBox(height: 4),
+              Text(
+                _manifest!.metadata.source!,
+                style: TextStyle(color: Colors.grey[500], fontSize: 12),
               ),
+            ],
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 4,
+              children: [
+                _buildInfoChip(Icons.photo_library, '${_manifest!.screenshots.length} shots'),
+                _buildInfoChip(Icons.star, '${_manifest!.priorityScreenshots.length} priority'),
+                _buildInfoChip(Icons.people, '${_manifest!.speakers.length} speakers'),
+                if (_sourceWidth > 0)
+                  _buildInfoChip(Icons.high_quality, '${_sourceWidth}x$_sourceHeight'),
+              ],
+            ),
+            if (_outputDirectory != null) ...[
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.green.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.green.withOpacity(0.3)),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.folder, size: 16, color: Colors.green[400]),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _outputDirectory!.split('/').last,
+                        style: TextStyle(fontSize: 11, color: Colors.green[400], fontFamily: 'monospace'),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCurrentCaptionCard(ScreenshotConfig config) {
+    return Container(
+      margin: const EdgeInsets.only(top: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.black26,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: _getSpeakerColor(config.speakerId),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  config.timestamp,
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                ),
+              ),
+              const SizedBox(width: 8),
+              if (config.speakerId != null)
+                Text(
+                  _getSpeakerName(config.speakerId!),
+                  style: TextStyle(
+                    color: _getSpeakerColor(config.speakerId),
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(config.captionHr, style: const TextStyle(fontSize: 13)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatusCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Row(
+          children: [
+            if (_isLoading || _isCapturing)
+              const Padding(
+                padding: EdgeInsets.only(right: 12),
+                child: SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+            Expanded(
+              child: Text(
+                _statusMessage,
+                style: const TextStyle(fontSize: 14),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildActionButtons() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        // Main capture button or Continue button when paused
+        if (_capturePaused)
+          ElevatedButton.icon(
+            onPressed: _continueCapturing,
+            icon: const Icon(Icons.play_arrow),
+            label: Text('Continue from #${_pausedAtIndex + 1}'),
+            style: ElevatedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 20),
+              backgroundColor: Colors.green[700],
+            ),
+          )
+        else
+          ElevatedButton.icon(
+            onPressed: (_isLoading || _isCapturing || _player == null)
+                ? null
+                : _captureScreenshots,
+            icon: Icon(_isCapturing ? Icons.hourglass_top : Icons.camera_alt),
+            label: Text(_isCapturing ? 'Capturing...' : 'Capture All Screenshots'),
+            style: ElevatedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 20),
+            ),
+          ),
+        const SizedBox(width: 16),
+        // Cancel button when paused
+        if (_capturePaused)
+          OutlinedButton.icon(
+            onPressed: () {
+              setState(() {
+                _isCapturing = false;
+                _capturePaused = false;
+                _pausedAtIndex = -1;
+                _statusMessage = 'Capture cancelled.';
+              });
+            },
+            icon: const Icon(Icons.cancel),
+            label: const Text('Cancel'),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: Colors.red[400],
+            ),
+          )
+        else
+          OutlinedButton.icon(
+            onPressed: _isLoading || _isCapturing ? null : _pickConfigFile,
+            icon: const Icon(Icons.folder_open),
+            label: const Text('Load Different Config'),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildQueueStats() {
+    if (_manifest == null) return const SizedBox();
+
+    final pending = _manifest!.screenshots.where((s) => s.status == ScreenshotStatus.pending).length;
+    final inProgress = _manifest!.screenshots.where((s) => s.status == ScreenshotStatus.inProgress).length;
+    final completed = _manifest!.screenshots.where((s) => s.status == ScreenshotStatus.completed).length;
+    final failed = _manifest!.screenshots.where((s) => s.status == ScreenshotStatus.failed).length;
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (pending > 0) _buildStatBadge(pending, Colors.grey),
+        if (inProgress > 0) _buildStatBadge(inProgress, Colors.orange),
+        if (completed > 0) _buildStatBadge(completed, Colors.green),
+        if (failed > 0) _buildStatBadge(failed, Colors.red),
+      ],
+    );
+  }
+
+  Widget _buildStatBadge(int count, Color color) {
+    return Container(
+      margin: const EdgeInsets.only(left: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.2),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Text(
+        '$count',
+        style: TextStyle(fontSize: 10, color: color, fontWeight: FontWeight.bold),
+      ),
+    );
+  }
+
+  Widget _buildQueueItem(ScreenshotConfig config, int index) {
+    final isActive = _currentIndex == index;
+
+    Color statusColor;
+    IconData statusIcon;
+    switch (config.status) {
+      case ScreenshotStatus.pending:
+        statusColor = Colors.grey;
+        statusIcon = Icons.schedule;
+        break;
+      case ScreenshotStatus.inProgress:
+        statusColor = Colors.orange;
+        statusIcon = Icons.play_circle;
+        break;
+      case ScreenshotStatus.completed:
+        statusColor = Colors.green;
+        statusIcon = Icons.check_circle;
+        break;
+      case ScreenshotStatus.failed:
+        statusColor = Colors.red;
+        statusIcon = Icons.error;
+        break;
+    }
+
+    return GestureDetector(
+      onTap: () => _onQueueItemTap(config, index),
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: Container(
+          height: 80,
+          margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: isActive ? const Color(0xFF2D2D44) : const Color(0xFF1E1E2E),
+            borderRadius: BorderRadius.circular(8),
+            border: isActive
+                ? Border.all(color: const Color(0xFF6C5CE7), width: 2)
+                : Border.all(color: Colors.grey[800]!, width: 1),
+          ),
+          child: Row(
+            children: [
+              // Thumbnail or placeholder
+              Container(
+                width: 100,
+                height: 80,
+                decoration: BoxDecoration(
+                  color: Colors.black26,
+                  borderRadius: const BorderRadius.only(
+                    topLeft: Radius.circular(7),
+                    bottomLeft: Radius.circular(7),
+                  ),
+                ),
+                child: config.thumbnailBytes != null
+                    ? ClipRRect(
+                        borderRadius: const BorderRadius.only(
+                          topLeft: Radius.circular(7),
+                          bottomLeft: Radius.circular(7),
+                        ),
+                        child: Image.memory(
+                          config.thumbnailBytes!,
+                          fit: BoxFit.cover,
+                        ),
+                      )
+                    : Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(statusIcon, color: statusColor, size: 24),
+                            const SizedBox(height: 4),
+                            Text(
+                              config.timestamp,
+                              style: TextStyle(fontSize: 10, color: Colors.grey[500]),
+                            ),
+                          ],
+                        ),
+                      ),
+              ),
+
+              // Info
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Row(
+                        children: [
+                          Container(
+                            width: 8,
+                            height: 8,
+                            decoration: BoxDecoration(
+                              color: statusColor,
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            '#${config.id}',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.grey[400],
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            config.timestamp,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: _getSpeakerColor(config.speakerId),
+                            ),
+                          ),
+                          if (config.isPriority) ...[
+                            const SizedBox(width: 4),
+                            Icon(Icons.star, size: 12, color: Colors.amber[400]),
+                          ],
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        config.captionHr,
+                        style: const TextStyle(fontSize: 10),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
